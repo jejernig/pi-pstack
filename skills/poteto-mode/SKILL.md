@@ -31,7 +31,7 @@ Remaining triggers:
 
 ## Principles
 
-Read the leaf skill in full for any principle you apply. Each entry names when it applies.
+Read the leaf skill in full for any principle you apply. The leaf skills live at `../principle-*/SKILL.md` relative to this file; replace `*` with the principle name's suffix. Each entry names when it applies.
 
 **Core**
 
