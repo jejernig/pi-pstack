@@ -103,7 +103,7 @@ async function temporaryPrompt(agent: AgentConfig): Promise<{ directory: string;
   const file = path.join(directory, `${agent.name.replace(/[^a-z0-9_.-]/gi, "_")}.md`);
   let prompt = agent.systemPrompt.trim();
   if (agent.name === "poteto-agent") {
-    prompt += `\n\nBefore any work, use the read tool to load ${path.join(packageRoot(), "skills/poteto-mode/SKILL.md")} in full. It is the canonical Pi pstack mode.`;
+    prompt += `\n\nBefore any work, use the read tool to load ${path.join(packageRoot(), "skills/poteto-mode/SKILL.md")} in full. Read this exact absolute path without searching; installed packages may be ignored by file-search tools. It is the canonical Pi pstack mode.`;
   }
   await fsp.writeFile(file, prompt, { encoding: "utf8", mode: 0o600 });
   return { directory, file };
