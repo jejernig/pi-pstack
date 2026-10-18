@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
 import * as os from "node:os";
@@ -140,6 +140,11 @@ async function runChild(
     stderr: "",
     usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
   };
+
+  if (process.env.HERDR_ENV === "1") {
+    return await runChildVisible(agent, task, model, parentCwd, signal);
+  }
+
   const temp = await temporaryPrompt(agent);
   try {
     const args = ["--mode", "json", "--print", "--no-session", "--append-system-prompt", temp.file];
@@ -214,6 +219,160 @@ async function runChild(
     await fsp.rm(temp.directory, { recursive: true, force: true });
   }
   return result;
+}
+
+const ANSI_ESCAPE = /\u001b\[[0-9;?]*[ -/]*[@-~]/g;
+
+function stripAnsiText(text: string): string {
+  return text.replace(ANSI_ESCAPE, "");
+}
+
+function runHerdrCmd(args: string[], timeoutMs = 30000): Promise<{ code: number; stdout: string; stderr: string }> {
+  return new Promise((resolve) => {
+    execFile("herdr", args, { timeout: timeoutMs, maxBuffer: 16 * 1024 * 1024 }, (err, stdout, stderr) => {
+      const e = err as (NodeJS.ErrnoException & { code?: number | string }) | null;
+      const code = e && typeof e.code === "number" ? e.code : e ? 1 : 0;
+      resolve({ code, stdout: String(stdout ?? ""), stderr: String(stderr ?? "") });
+    });
+  });
+}
+
+function parseJson<T>(r: { stdout: string }): T | undefined {
+  try {
+    return JSON.parse(r.stdout) as T;
+  } catch {
+    return undefined;
+  }
+}
+
+function uniqueSubName(): string {
+  return `sub-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
+}
+
+function finalTextFromSession(sessionPath: string | undefined): string | undefined {
+  if (!sessionPath) return undefined;
+  try {
+    const lines = fs.readFileSync(sessionPath, "utf8").split("\n");
+    let last = "";
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      try {
+        const entry = JSON.parse(line) as { type?: string; message?: { role?: string; content?: Array<{ type?: string; text?: string }> } };
+        if (entry.type !== "message") continue;
+        const m = entry.message;
+        if (!m || m.role !== "assistant" || !Array.isArray(m.content)) continue;
+        const text = m.content.filter((c) => c && c.type === "text" && typeof c.text === "string").map((c) => c.text).join("\n");
+        if (text.trim()) last = text;
+      } catch {
+        // skip malformed lines
+      }
+    }
+    return last.trim() || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function childError(agent: AgentConfig, task: TaskInput, model: string | undefined, stderr: string): ChildResult {
+  return {
+    agent: agent.name,
+    source: agent.source,
+    task: task.task,
+    model,
+    exitCode: 1,
+    messages: [],
+    stderr,
+    usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
+  };
+}
+
+function childSuccess(agent: AgentConfig, task: TaskInput, model: string | undefined, answer: string): ChildResult {
+  return {
+    agent: agent.name,
+    source: agent.source,
+    task: task.task,
+    model,
+    exitCode: 0,
+    messages: [{ role: "assistant", content: [{ type: "text", text: answer }] } as Message],
+    stderr: "",
+    usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 1 },
+    stopReason: "stop",
+  };
+}
+
+async function runChildVisible(
+  agent: AgentConfig,
+  task: TaskInput,
+  model: string | undefined,
+  parentCwd: string,
+  signal: AbortSignal | undefined,
+): Promise<ChildResult> {
+  if (signal?.aborted) {
+    return { ...childError(agent, task, model, "aborted"), stopReason: "aborted" };
+  }
+
+  const name = uniqueSubName();
+  const jobCwd = task.cwd ?? parentCwd;
+  const promptParts = [`[Subagent: ${agent.name}]`];
+  if (agent.systemPrompt?.trim()) promptParts.push(agent.systemPrompt.trim());
+  promptParts.push("---", `Delegated task:\n${task.task}`);
+  const promptText = promptParts.join("\n\n");
+
+  const splitR = await runHerdrCmd(["pane", "split", "--current", "--direction", "right", "--cwd", jobCwd, "--no-focus"]);
+  const split = parseJson<{ result?: { pane?: { pane_id?: string } } }>(splitR);
+  const paneId = split?.result?.pane?.pane_id;
+  if (!paneId) {
+    return childError(agent, task, model, `herdr pane split failed: ${splitR.stderr || splitR.stdout}`);
+  }
+
+  let sessionPath: string | undefined;
+  let started = false;
+  for (let attempt = 0; attempt < 3 && !started; attempt++) {
+    const startArgs = ["agent", "start", name, "--kind", "pi", "--pane", paneId];
+    const piArgs: string[] = [
+      "--extension", path.join(packageRoot(), "extensions/pstack/index.ts"),
+      "--skill", path.join(packageRoot(), "skills"),
+    ];
+    if (model) piArgs.push("--model", model);
+    if (agent.tools?.length) piArgs.push("--tools", agent.tools.join(","));
+    if (piArgs.length) startArgs.push("--", ...piArgs);
+    const startR = await runHerdrCmd(startArgs, 60000);
+    const startJ = parseJson<{ result?: { agent?: { agent_status?: string; agent_session?: { value?: string } } } }>(startR);
+    if (startJ?.result?.agent?.agent_status) {
+      sessionPath = startJ.result.agent.agent_session?.value;
+      started = true;
+    } else {
+      await new Promise((res) => setTimeout(res, 1500));
+    }
+  }
+  if (!started) {
+    await runHerdrCmd(["pane", "close", paneId]);
+    return childError(agent, task, model, `agent start did not reach a ready state in pane ${paneId}`);
+  }
+
+  const onAbort = () => {
+    void runHerdrCmd(["pane", "close", paneId]);
+  };
+  if (signal?.aborted) {
+    onAbort();
+    return { ...childError(agent, task, model, "aborted"), stopReason: "aborted" };
+  }
+  signal?.addEventListener("abort", onAbort, { once: true });
+
+  const promptR = await runHerdrCmd(["agent", "prompt", name, promptText, "--wait", "--timeout", "600000"], 615000);
+  signal?.removeEventListener("abort", onAbort);
+  if (promptR.code !== 0) {
+    await runHerdrCmd(["pane", "close", paneId]);
+    return childError(agent, task, model, `subagent ${name} failed: ${promptR.stderr || promptR.stdout}`);
+  }
+
+  const answer = finalTextFromSession(sessionPath);
+  if (answer) {
+    return childSuccess(agent, task, model, answer);
+  }
+
+  const readR = await runHerdrCmd(["agent", "read", name, "--source", "recent-unwrapped", "--lines", "400"]);
+  return childSuccess(agent, task, model, stripAnsiText(readR.stdout).trim() || "(no output)");
 }
 
 async function runLimited<T>(items: T[], callback: (item: T, index: number) => Promise<ChildResult>): Promise<ChildResult[]> {
