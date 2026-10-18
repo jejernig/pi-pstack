@@ -61,7 +61,12 @@ type ChildResult = {
   usage: Usage;
   stopReason?: string;
   errorMessage?: string;
+  pane?: PaneDisposition;
 };
+
+type PaneDisposition =
+  | { kind: "closed"; id: string }
+  | { kind: "left-open" | "uncertain"; id: string; reason: string };
 
 function packageRoot(): string {
   return path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
@@ -71,7 +76,12 @@ function resultText(result: ChildResult): string {
   const final = [...result.messages].reverse().find((message) => message.role === "assistant");
   if (final?.role === "assistant") {
     const text = final.content.find((part) => part.type === "text");
-    if (text?.type === "text") return text.text;
+    if (text?.type === "text") {
+      const pane = result.pane;
+      return pane && pane.kind !== "closed"
+        ? `${text.text}\n\n[Pane ${pane.id}: ${pane.reason}; ${pane.kind}.]`
+        : text.text;
+    }
   }
   return result.errorMessage || result.stderr || "(no output)";
 }
@@ -107,6 +117,29 @@ async function temporaryPrompt(agent: AgentConfig): Promise<{ directory: string;
   }
   await fsp.writeFile(file, prompt, { encoding: "utf8", mode: 0o600 });
   return { directory, file };
+}
+
+function recordAssistantUsage(result: ChildResult, message: Extract<Message, { role: "assistant" }>): void {
+  result.usage.turns += 1;
+  const usage = message.usage;
+  if (usage) {
+    result.usage.input += usage.input ?? 0;
+    result.usage.output += usage.output ?? 0;
+    result.usage.cacheRead += usage.cacheRead ?? 0;
+    result.usage.cacheWrite += usage.cacheWrite ?? 0;
+    result.usage.cost += usage.cost?.total ?? 0;
+  }
+  result.stopReason = message.stopReason;
+  result.errorMessage = message.errorMessage;
+  if (!result.model && message.model) result.model = message.model;
+}
+
+function recordChildEvent(result: ChildResult, event: { type?: string; message?: Message }, update: () => void): void {
+  if (event.type !== "message_end" && event.type !== "tool_result_end") return;
+  if (!event.message) return;
+  result.messages.push(event.message);
+  if (event.message.role === "assistant") recordAssistantUsage(result, event.message);
+  update();
 }
 
 async function runChild(
@@ -165,25 +198,7 @@ async function runChild(
       const parse = (line: string) => {
         if (!line.trim()) return;
         try {
-          const event = JSON.parse(line) as { type?: string; message?: Message };
-          if ((event.type === "message_end" || event.type === "tool_result_end") && event.message) {
-            result.messages.push(event.message);
-            if (event.message.role === "assistant") {
-              result.usage.turns += 1;
-              const usage = event.message.usage;
-              if (usage) {
-                result.usage.input += usage.input ?? 0;
-                result.usage.output += usage.output ?? 0;
-                result.usage.cacheRead += usage.cacheRead ?? 0;
-                result.usage.cacheWrite += usage.cacheWrite ?? 0;
-                result.usage.cost += usage.cost?.total ?? 0;
-              }
-              result.stopReason = event.message.stopReason;
-              result.errorMessage = event.message.errorMessage;
-              if (!result.model && event.message.model) result.model = event.message.model;
-            }
-            update();
-          }
+          recordChildEvent(result, JSON.parse(line) as { type?: string; message?: Message }, update);
         } catch {
           // JSON mode can include diagnostics from third-party extensions. Ignore non-events.
         }
@@ -246,28 +261,32 @@ function parseJson<T>(r: { stdout: string }): T | undefined {
 }
 
 function uniqueSubName(): string {
-  return `sub-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
+  return `psub-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
+}
+
+function assistantTextFromLine(line: string): string | undefined {
+  if (!line.trim()) return undefined;
+  try {
+    const entry = JSON.parse(line) as { type?: string; message?: { role?: string; content?: Array<{ type?: string; text?: string }> } };
+    if (entry.type !== "message" || entry.message?.role !== "assistant") return undefined;
+    const content = entry.message.content;
+    if (!Array.isArray(content)) return undefined;
+    const text = content.filter((part) => part?.type === "text" && typeof part.text === "string")
+      .map((part) => part.text).join("\n").trim();
+    return text || undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function finalTextFromSession(sessionPath: string | undefined): string | undefined {
   if (!sessionPath) return undefined;
   try {
-    const lines = fs.readFileSync(sessionPath, "utf8").split("\n");
-    let last = "";
-    for (const line of lines) {
-      if (!line.trim()) continue;
-      try {
-        const entry = JSON.parse(line) as { type?: string; message?: { role?: string; content?: Array<{ type?: string; text?: string }> } };
-        if (entry.type !== "message") continue;
-        const m = entry.message;
-        if (!m || m.role !== "assistant" || !Array.isArray(m.content)) continue;
-        const text = m.content.filter((c) => c && c.type === "text" && typeof c.text === "string").map((c) => c.text).join("\n");
-        if (text.trim()) last = text;
-      } catch {
-        // skip malformed lines
-      }
+    let last: string | undefined;
+    for (const line of fs.readFileSync(sessionPath, "utf8").split("\n")) {
+      last = assistantTextFromLine(line) || last;
     }
-    return last.trim() || undefined;
+    return last;
   } catch {
     return undefined;
   }
@@ -300,6 +319,112 @@ function childSuccess(agent: AgentConfig, task: TaskInput, model: string | undef
   };
 }
 
+type ChildIdentity = { paneId: string; terminalId: string; status: string; sequence: number };
+
+function parseChildIdentity(agent: {
+  pane_id?: unknown; terminal_id?: unknown; agent_status?: unknown; state_change_seq?: unknown;
+} | undefined): ChildIdentity | undefined {
+  if (typeof agent?.pane_id !== "string") return undefined;
+  if (typeof agent.terminal_id !== "string") return undefined;
+  if (typeof agent.agent_status !== "string") return undefined;
+  if (typeof agent.state_change_seq !== "number") return undefined;
+  return { paneId: agent.pane_id, terminalId: agent.terminal_id,
+    status: agent.agent_status, sequence: agent.state_change_seq };
+}
+
+async function childIdentity(name: string): Promise<ChildIdentity | undefined> {
+  const response = await runHerdrCmd(["agent", "get", name]);
+  if (response.code !== 0) return undefined;
+  const agent = parseJson<{ result?: { agent?: {
+    pane_id?: unknown; terminal_id?: unknown; agent_status?: unknown; state_change_seq?: unknown;
+  } } }>(response)?.result?.agent;
+  return parseChildIdentity(agent);
+}
+
+function settledChild(current: ChildIdentity | undefined, original: ChildIdentity): boolean {
+  return current?.paneId === original.paneId && current.terminalId === original.terminalId
+    && (current.status === "idle" || current.status === "done") && current.sequence > original.sequence;
+}
+
+function openChildError(agent: AgentConfig, task: TaskInput, model: string | undefined, paneId: string, reason: string): ChildResult {
+  return { ...childError(agent, task, model, `Pane ${paneId} left open: ${reason}`),
+    pane: { kind: "left-open", id: paneId, reason } };
+}
+
+async function onlyPiForeground(id: string): Promise<boolean> {
+  const response = await runHerdrCmd(["pane", "process-info", "--pane", id]);
+  if (response.code !== 0) return false;
+  const processes = parseJson<{ result?: { process_info?: { foreground_processes?: Array<{ name?: string }> } } }>(response)
+    ?.result?.process_info?.foreground_processes;
+  return Array.isArray(processes) && processes.length === 1 && processes[0]?.name === "pi";
+}
+
+async function closePane(id: string): Promise<PaneDisposition> {
+  const closed = await runHerdrCmd(["pane", "close", id]);
+  const response = parseJson<{ result?: unknown; error?: unknown }>(closed);
+  return closed.code === 0 && response?.result !== undefined && response.error === undefined
+    ? { kind: "closed", id }
+    : { kind: "uncertain", id, reason: "pane close was not confirmed" };
+}
+
+async function closeCompletedChild(name: string, original: ChildIdentity): Promise<PaneDisposition> {
+  const id = original.paneId;
+  if (!settledChild(await childIdentity(name), original)) {
+    return { kind: "left-open", id, reason: "child identity or settled turn changed" };
+  }
+  if (!await onlyPiForeground(id)) return { kind: "left-open", id, reason: "foreground process is not only Pi" };
+  if (!settledChild(await childIdentity(name), original)) {
+    return { kind: "left-open", id, reason: "child identity or settled turn changed" };
+  }
+  return closePane(id);
+}
+
+async function createVisiblePane(cwd: string): Promise<string | undefined> {
+  const response = await runHerdrCmd(["pane", "split", "--current", "--direction", "right", "--cwd", cwd, "--no-focus"]);
+  if (response.code !== 0) return undefined;
+  const id = parseJson<{ result?: { pane?: { pane_id?: unknown } } }>(response)?.result?.pane?.pane_id;
+  return typeof id === "string" ? id : undefined;
+}
+
+async function startVisibleAgent(name: string, paneId: string, agent: AgentConfig, model: string | undefined): Promise<
+  { kind: "started"; sessionPath?: string } | { kind: "failed" }
+> {
+  const piArgs = ["--extension", path.join(packageRoot(), "extensions/pstack/index.ts"),
+    "--skill", path.join(packageRoot(), "skills")];
+  if (model) piArgs.push("--model", model);
+  if (agent.tools?.length) piArgs.push("--tools", agent.tools.join(","));
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const response = await runHerdrCmd(["agent", "start", name, "--kind", "pi", "--pane", paneId, "--", ...piArgs], 60000);
+    const started = parseJson<{ result?: { agent?: { agent_status?: string; agent_session?: { value?: string } } } }>(response)
+      ?.result?.agent;
+    if (response.code === 0 && started?.agent_status) {
+      return { kind: "started", sessionPath: started.agent_session?.value };
+    }
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+  }
+  return { kind: "failed" };
+}
+
+function visiblePrompt(agent: AgentConfig, task: TaskInput): string {
+  const parts = [`[Subagent: ${agent.name}]`];
+  if (agent.systemPrompt?.trim()) parts.push(agent.systemPrompt.trim());
+  parts.push("---", `Delegated task:\n${task.task}`);
+  return parts.join("\n\n");
+}
+
+async function visibleAnswer(name: string, sessionPath: string | undefined): Promise<string | undefined> {
+  const answer = finalTextFromSession(sessionPath);
+  if (answer) return answer;
+  const read = await runHerdrCmd(["agent", "read", name, "--source", "recent-unwrapped", "--lines", "400"]);
+  return read.code === 0 ? stripAnsiText(read.stdout).trim() || undefined : undefined;
+}
+
+async function initialVisibleIdentity(name: string, paneId: string): Promise<ChildIdentity | undefined> {
+  const identity = await childIdentity(name);
+  if (identity?.paneId !== paneId) return undefined;
+  return identity.status === "idle" || identity.status === "done" ? identity : undefined;
+}
+
 export async function runChildVisible(
   agent: AgentConfig,
   task: TaskInput,
@@ -312,67 +437,26 @@ export async function runChildVisible(
   }
 
   const name = uniqueSubName();
-  const jobCwd = task.cwd ?? parentCwd;
-  const promptParts = [`[Subagent: ${agent.name}]`];
-  if (agent.systemPrompt?.trim()) promptParts.push(agent.systemPrompt.trim());
-  promptParts.push("---", `Delegated task:\n${task.task}`);
-  const promptText = promptParts.join("\n\n");
+  const paneId = await createVisiblePane(task.cwd ?? parentCwd);
+  if (!paneId) return childError(agent, task, model, "herdr pane split did not return a pane ID");
+  const started = await startVisibleAgent(name, paneId, agent, model);
+  if (started.kind === "failed") return openChildError(agent, task, model, paneId, "agent did not start in this pane");
+  const original = await initialVisibleIdentity(name, paneId);
+  if (!original) return openChildError(agent, task, model, paneId, "agent identity or readiness could not be verified");
+  if (signal?.aborted) return openChildError(agent, task, model, paneId, "delegation was aborted before prompt");
 
-  const splitR = await runHerdrCmd(["pane", "split", "--current", "--direction", "right", "--cwd", jobCwd, "--no-focus"]);
-  const split = parseJson<{ result?: { pane?: { pane_id?: string } } }>(splitR);
-  const paneId = split?.result?.pane?.pane_id;
-  if (!paneId) {
-    return childError(agent, task, model, `herdr pane split failed: ${splitR.stderr || splitR.stdout}`);
-  }
-
-  let sessionPath: string | undefined;
-  let started = false;
-  for (let attempt = 0; attempt < 3 && !started; attempt++) {
-    const startArgs = ["agent", "start", name, "--kind", "pi", "--pane", paneId];
-    const piArgs: string[] = [
-      "--extension", path.join(packageRoot(), "extensions/pstack/index.ts"),
-      "--skill", path.join(packageRoot(), "skills"),
-    ];
-    if (model) piArgs.push("--model", model);
-    if (agent.tools?.length) piArgs.push("--tools", agent.tools.join(","));
-    if (piArgs.length) startArgs.push("--", ...piArgs);
-    const startR = await runHerdrCmd(startArgs, 60000);
-    const startJ = parseJson<{ result?: { agent?: { agent_status?: string; agent_session?: { value?: string } } } }>(startR);
-    if (startJ?.result?.agent?.agent_status) {
-      sessionPath = startJ.result.agent.agent_session?.value;
-      started = true;
-    } else {
-      await new Promise((res) => setTimeout(res, 1500));
-    }
-  }
-  if (!started) {
-    await runHerdrCmd(["pane", "close", paneId]);
-    return childError(agent, task, model, `agent start did not reach a ready state in pane ${paneId}`);
-  }
-
-  const onAbort = () => {
-    void runHerdrCmd(["pane", "close", paneId]);
-  };
-  if (signal?.aborted) {
-    onAbort();
-    return { ...childError(agent, task, model, "aborted"), stopReason: "aborted" };
-  }
-  signal?.addEventListener("abort", onAbort, { once: true });
-
-  const promptR = await runHerdrCmd(["agent", "prompt", name, promptText, "--wait", "--timeout", "600000"], 615000);
-  signal?.removeEventListener("abort", onAbort);
+  const promptR = await runHerdrCmd(["agent", "prompt", name, visiblePrompt(agent, task), "--wait", "--timeout", "600000"], 615000);
+  if (signal?.aborted) return openChildError(agent, task, model, paneId, "delegation was aborted; submission outcome unknown");
   if (promptR.code !== 0) {
-    await runHerdrCmd(["pane", "close", paneId]);
-    return childError(agent, task, model, `subagent ${name} failed: ${promptR.stderr || promptR.stdout}`);
+    return openChildError(agent, task, model, paneId, `prompt outcome uncertain: ${promptR.stderr || promptR.stdout}`);
+  }
+  if (!settledChild(await childIdentity(name), original)) {
+    return openChildError(agent, task, model, paneId, "child identity or new settled turn not verified");
   }
 
-  const answer = finalTextFromSession(sessionPath);
-  if (answer) {
-    return childSuccess(agent, task, model, answer);
-  }
-
-  const readR = await runHerdrCmd(["agent", "read", name, "--source", "recent-unwrapped", "--lines", "400"]);
-  return childSuccess(agent, task, model, stripAnsiText(readR.stdout).trim() || "(no output)");
+  const answer = await visibleAnswer(name, started.sessionPath);
+  if (!answer) return openChildError(agent, task, model, paneId, "no completed result was captured");
+  return { ...childSuccess(agent, task, model, answer), pane: await closeCompletedChild(name, original) };
 }
 
 async function runLimited<T>(items: T[], callback: (item: T, index: number) => Promise<ChildResult>): Promise<ChildResult[]> {
@@ -400,6 +484,80 @@ function knownExternalWrite(command: string): string | undefined {
     [/\brm\s+(-[A-Za-z]*r|--recursive)/, "recursive deletion"],
   ];
   return patterns.find(([pattern]) => pattern.test(command))?.[1];
+}
+
+type StartChild = (task: TaskInput, index?: number, update?: (result: ChildResult) => void) => Promise<ChildResult>;
+type ChildUpdate = (results: ChildResult[]) => void;
+type SubagentToolResult = {
+  content: Array<{ type: "text"; text: string }>;
+  details: { mode: "single" | "parallel" | "chain"; results: ChildResult[] };
+};
+
+async function executeChain(tasks: TaskInput[], start: StartChild, makeUpdate: ChildUpdate): Promise<SubagentToolResult> {
+  const results: ChildResult[] = [];
+  let previous = "";
+  for (const [index, task] of tasks.entries()) {
+    const result = await start({ ...task, task: task.task.replaceAll("{previous}", previous) }, index,
+      (current) => makeUpdate([...results, current]));
+    results.push(result);
+    if (failure(result)) throw new Error(`Chain step ${index + 1} (${result.agent}) failed: ${resultText(result)}`);
+    previous = resultText(result);
+  }
+  return { content: [{ type: "text", text: previous }], details: { mode: "chain", results } };
+}
+
+async function executeParallel(tasks: TaskInput[], start: StartChild, makeUpdate: ChildUpdate): Promise<SubagentToolResult> {
+  if (tasks.length > MAX_PARALLEL_TASKS) throw new Error(`At most ${MAX_PARALLEL_TASKS} parallel tasks are allowed.`);
+  const updates: ChildResult[] = tasks.map((task) => ({ agent: task.agent, source: "pending", task: task.task,
+    exitCode: -1, messages: [], stderr: "", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 } }));
+  const results = await runLimited(tasks, async (task, index) => {
+    const result = await start(task, index, (current) => { updates[index] = current; makeUpdate(updates); });
+    updates[index] = result;
+    makeUpdate(updates);
+    return result;
+  });
+  const report = results.map((result) => `### ${result.agent} ${failure(result) ? "failed" : "completed"}\n\n${truncate(resultText(result))}`).join("\n\n---\n\n");
+  return { content: [{ type: "text", text: report }], details: { mode: "parallel", results } };
+}
+
+async function executeSingle(task: TaskInput, start: StartChild, makeUpdate: ChildUpdate): Promise<SubagentToolResult> {
+  const result = await start(task, 0, (current) => makeUpdate([current]));
+  if (failure(result)) throw new Error(`${result.agent} failed: ${resultText(result)}`);
+  return { content: [{ type: "text", text: resultText(result) }], details: { mode: "single", results: [result] } };
+}
+
+async function confirmProjectAgents(
+  scope: AgentScope, requested: TaskInput[], agents: AgentConfig[], cwd: string,
+  confirm: (title: string, message: string) => Promise<boolean>,
+): Promise<void> {
+  if (scope !== "project" && scope !== "both") return;
+  const names = requested.map((task) => task.agent);
+  const project = agents.filter((agent) => agent.source === "project" && names.includes(agent.name));
+  if (!project.length) return;
+  const approved = await confirm("Run project-local Pi agents?",
+    `Agents: ${project.map((agent) => agent.name).join(", ")}\nSource: ${projectAgentsDirectory(cwd)}`);
+  if (!approved) throw new Error("Project-local agents were not approved.");
+}
+
+function childModelForTask(task: TaskInput, index: number, config: Awaited<ReturnType<typeof readConfig>>, fallback?: string): string | undefined {
+  const pool = modelsForRole(config, task.role);
+  return task.model ?? pool[index % Math.max(pool.length, 1)] ?? fallback;
+}
+
+type DelegationMode =
+  | { kind: "single"; task: TaskInput }
+  | { kind: "parallel"; tasks: TaskInput[] }
+  | { kind: "chain"; tasks: TaskInput[] };
+
+function delegationMode(params: Partial<TaskInput> & { tasks?: TaskInput[]; chain?: TaskInput[] }): DelegationMode {
+  const single = params.agent && params.task ? { agent: params.agent, task: params.task,
+    model: params.model, role: params.role, cwd: params.cwd } : undefined;
+  const count = Number(Boolean(single)) + Number(Boolean(params.tasks?.length)) + Number(Boolean(params.chain?.length));
+  if (count !== 1) throw new Error("Provide exactly one mode: agent + task, tasks, or chain.");
+  if (params.chain?.length) return { kind: "chain", tasks: params.chain };
+  if (params.tasks?.length) return { kind: "parallel", tasks: params.tasks };
+  if (!single) throw new Error("Missing single subagent task.");
+  return { kind: "single", task: single };
 }
 
 export default function (pi: ExtensionAPI) {
@@ -458,7 +616,8 @@ export default function (pi: ExtensionAPI) {
       potetoMode = true;
       pi.appendEntry(MODE_ENTRY, { enabled: true });
       ctx.ui.setStatus("pstack-mode", "pstack: poteto mode");
-      await ctx.sendUserMessage(`/skill:poteto-mode${args.trim() ? ` ${args.trim()}` : ""}`);
+      pi.sendUserMessage(`/skill:poteto-mode${args.trim() ? ` ${args.trim()}` : ""}`,
+        { deliverAs: ctx.isIdle() ? undefined : "followUp", expandPromptTemplates: true });
     },
   });
 
@@ -509,7 +668,7 @@ export default function (pi: ExtensionAPI) {
     parameters: Type.Object({ action: StringEnum(["list"] as const) }),
     async execute(_id, _params, _signal, _update, ctx) {
       const sessions = await SessionManager.list(ctx.cwd);
-      const files = sessions.map((session) => session.file);
+      const files = sessions.map((session) => session.path);
       return { content: [{ type: "text", text: files.join("\n") || "No saved sessions for this working directory." }], details: { files } };
     },
   });
@@ -548,54 +707,23 @@ export default function (pi: ExtensionAPI) {
     async execute(_id, params, signal, onUpdate, ctx) {
       const scope = (params.agentScope ?? "bundled") as AgentScope;
       const agents = discoverAgents(ctx.cwd, scope);
-      const requested = params.agent ? [{ agent: params.agent, task: params.task ?? "", model: params.model, role: params.role, cwd: params.cwd }] : undefined;
-      const modes = Number(Boolean(requested && params.task)) + Number(Boolean(params.tasks?.length)) + Number(Boolean(params.chain?.length));
-      if (modes !== 1) throw new Error("Provide exactly one mode: agent + task, tasks, or chain.");
-      if ((scope === "project" || scope === "both") && params.confirmProjectAgents !== false && ctx.hasUI) {
-        const names = [...(requested ?? []), ...(params.tasks ?? []), ...(params.chain ?? [])].map((task) => task.agent);
-        const project = agents.filter((agent) => agent.source === "project" && names.includes(agent.name));
-        if (project.length) {
-          const approved = await ctx.ui.confirm("Run project-local Pi agents?", `Agents: ${project.map((agent) => agent.name).join(", ")}\nSource: ${projectAgentsDirectory(ctx.cwd)}`);
-          if (!approved) throw new Error("Project-local agents were not approved.");
-        }
+      const mode = delegationMode(params);
+      if (params.confirmProjectAgents !== false && ctx.hasUI) {
+        await confirmProjectAgents(scope, mode.kind === "single" ? [mode.task] : mode.tasks,
+          agents, ctx.cwd, (title, message) => ctx.ui.confirm(title, message));
       }
       const config = await readConfig();
-      const childModel = (task: TaskInput, index = 0) => task.model ?? modelsForRole(config, task.role)[index % Math.max(modelsForRole(config, task.role).length, 1)] ?? (ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined);
+      const fallback = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
+      const childModel = (task: TaskInput, index = 0) => childModelForTask(task, index, config, fallback);
       const makeUpdate = (results: ChildResult[]) => onUpdate?.({
         content: [{ type: "text", text: results.map((result) => `${result.agent}: ${resultText(result)}`).join("\n\n") }],
         details: { results },
       });
       const start = (task: TaskInput, index = 0, update?: (result: ChildResult) => void) => runChild(ctx.cwd, task, agents, childModel(task, index), signal, update);
 
-      if (params.chain?.length) {
-        const results: ChildResult[] = [];
-        let previous = "";
-        for (const [index, task] of params.chain.entries()) {
-          const result = await start({ ...task, task: task.task.replaceAll("{previous}", previous) }, index, (current) => makeUpdate([...results, current]));
-          results.push(result);
-          if (failure(result)) throw new Error(`Chain step ${index + 1} (${result.agent}) failed: ${resultText(result)}`);
-          previous = resultText(result);
-        }
-        return { content: [{ type: "text", text: resultText(results.at(-1)!) }], details: { mode: "chain", results } };
-      }
-
-      if (params.tasks?.length) {
-        if (params.tasks.length > MAX_PARALLEL_TASKS) throw new Error(`At most ${MAX_PARALLEL_TASKS} parallel tasks are allowed.`);
-        const updates: ChildResult[] = params.tasks.map((task) => ({ agent: task.agent, source: "pending", task: task.task, exitCode: -1, messages: [], stderr: "", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 } }));
-        const results = await runLimited(params.tasks, async (task, index) => {
-          const result = await start(task, index, (current) => { updates[index] = current; makeUpdate(updates); });
-          updates[index] = result;
-          makeUpdate(updates);
-          return result;
-        });
-        const report = results.map((result) => `### ${result.agent} ${failure(result) ? "failed" : "completed"}\n\n${truncate(resultText(result))}`).join("\n\n---\n\n");
-        return { content: [{ type: "text", text: report }], details: { mode: "parallel", results } };
-      }
-
-      const task = requested![0];
-      const result = await start(task, 0, (current) => makeUpdate([current]));
-      if (failure(result)) throw new Error(`${result.agent} failed: ${resultText(result)}`);
-      return { content: [{ type: "text", text: resultText(result) }], details: { mode: "single", results: [result] } };
+      if (mode.kind === "chain") return executeChain(mode.tasks, start, makeUpdate);
+      if (mode.kind === "parallel") return executeParallel(mode.tasks, start, makeUpdate);
+      return executeSingle(mode.task, start, makeUpdate);
     },
   });
 }
