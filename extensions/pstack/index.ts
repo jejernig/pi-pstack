@@ -300,7 +300,7 @@ function childSuccess(agent: AgentConfig, task: TaskInput, model: string | undef
   };
 }
 
-async function runChildVisible(
+export async function runChildVisible(
   agent: AgentConfig,
   task: TaskInput,
   model: string | undefined,
