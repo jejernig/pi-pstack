@@ -12,6 +12,8 @@ pi install git:github.com/kkgogogo17/pi-pstack@v0.1.0
 
 Then restart Pi. Use `pi config` to enable or disable package resources.
 
+To test a source checkout, run `npm ci` before `npm test`. The lockfile installs Pi's peer packages locally for the Node test runner.
+
 ## Start
 
 ```text
