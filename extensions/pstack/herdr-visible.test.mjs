@@ -11,6 +11,13 @@ const agent = {
 };
 const task = { agent: 'poteto-agent', task: 'Return the verified result.' };
 
+test('the direct Node test command has installable Pi peer packages', () => {
+  const pkg = JSON.parse(readFileSync(new URL('../../package.json', import.meta.url), 'utf8'));
+  for (const name of ['@earendil-works/pi-ai', '@earendil-works/pi-coding-agent', 'typebox']) {
+    assert.ok(pkg.devDependencies?.[name], `${name} is required by the direct test import`);
+  }
+});
+
 function fixture(options = {}) {
   const root = mkdtempSync(path.join(tmpdir(), 'pstack-herdr-'));
   const bin = path.join(root, 'bin');
