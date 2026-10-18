@@ -34,7 +34,13 @@ const args = process.argv.slice(2);
 appendFileSync(process.env.HERDR_TEST_LOG, JSON.stringify(args) + '\\n');
 let result = { accepted: true };
 if (args[0] === 'pane' && args[1] === 'current') result = { pane: { pane_id: process.env.HERDR_TEST_PARENT_MISMATCH ? 'w9:p3' : 'w9:p1', terminal_id: 'parent-terminal' } };
-if (args[0] === 'pane' && args[1] === 'split') result = { pane: { pane_id: 'w9:p2' } };
+const calls = readFileSync(process.env.HERDR_TEST_LOG, 'utf8').trim().split('\\n').map(JSON.parse);
+const starts = calls.filter(x => x[0] === 'agent' && x[1] === 'start');
+const ownStart = starts.find(x => x[2] === args[2]);
+if (args[0] === 'pane' && args[1] === 'split') {
+  const splits = calls.filter(x => x[0] === 'pane' && x[1] === 'split').length;
+  result = { pane: { pane_id: process.env.HERDR_TEST_PARALLEL ? 'w9:p' + (splits + 1) : 'w9:p2' } };
+}
 if (args[0] === 'agent' && args[1] === 'start') {
   const promptFile = args[args.indexOf('--append-system-prompt') + 1];
   if (promptFile) appendFileSync(process.env.HERDR_TEST_LOG, JSON.stringify(['system-prompt', readFileSync(promptFile, 'utf8')]) + '\\n');
@@ -47,8 +53,9 @@ if (args[0] === 'agent' && args[1] === 'start') {
   result = { agent: { agent_status: 'idle' } };
 }
 if (args[0] === 'agent' && args[1] === 'get') {
-  const gets = readFileSync(process.env.HERDR_TEST_LOG, 'utf8').split('\\n').filter(x => x.includes('"get"')).length;
-  result = { agent: { pane_id: 'w9:p2', terminal_id: gets > 1 && process.env.HERDR_TEST_REPLACEMENT ? 'replacement' : 'terminal-2', agent_status: gets > 1 ? (process.env.HERDR_TEST_STATUS || 'idle') : 'idle', state_change_seq: gets > 1 ? 4 : 1 } };
+  const gets = calls.filter(x => x[0] === 'agent' && x[1] === 'get' && x[2] === args[2]).length;
+  const pane = ownStart?.[ownStart.indexOf('--pane') + 1] || 'w9:p2';
+  result = { agent: { pane_id: pane, terminal_id: gets > 1 && process.env.HERDR_TEST_REPLACEMENT ? 'replacement' : 'terminal-' + pane, agent_status: gets > 1 ? (process.env.HERDR_TEST_STATUS || 'idle') : 'idle', state_change_seq: gets > 1 ? 4 : 1 } };
 }
 if (args[0] === 'agent' && args[1] === 'prompt' && process.env.HERDR_TEST_PROMPT_DELAY) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Number(process.env.HERDR_TEST_PROMPT_DELAY));
@@ -58,12 +65,11 @@ if (args[0] === 'agent' && args[1] === 'prompt' && process.env.HERDR_TEST_PROMPT
   process.exit(1);
 }
 if (args[0] === 'agent' && args[1] === 'prompt' && !process.env.HERDR_TEST_EMPTY_SESSION) {
-  const start = readFileSync(process.env.HERDR_TEST_LOG, 'utf8').split('\\n').filter(Boolean).map(JSON.parse)
-    .find(x => x[0] === 'agent' && x[1] === 'start');
-  const sessionPath = start[start.indexOf('--session') + 1];
+  const sessionPath = ownStart[ownStart.indexOf('--session') + 1];
+  const answer = process.env.HERDR_TEST_PARALLEL ? args[3].split('Delegated task:\\n').at(-1).trim() : 'verified result';
   appendFileSync(sessionPath, JSON.stringify({ type: 'message', message: {
     role: 'assistant', stopReason: process.env.HERDR_TEST_TOOL_ONLY ? 'toolUse' : 'stop',
-    content: [{ type: 'text', text: 'verified result' }],
+    content: [{ type: 'text', text: answer }],
   } }) + '\\n');
 }
 if (args[0] === 'agent' && args[1] === 'read') {
@@ -91,6 +97,7 @@ process.stdout.write(JSON.stringify({ result }));
     HERDR_TEST_STALE_ANSWER: process.env.HERDR_TEST_STALE_ANSWER,
     HERDR_TEST_START_UNCERTAIN: process.env.HERDR_TEST_START_UNCERTAIN,
     HERDR_TEST_TOOL_ONLY: process.env.HERDR_TEST_TOOL_ONLY,
+    HERDR_TEST_PARALLEL: process.env.HERDR_TEST_PARALLEL,
   };
   process.env.HERDR_PANE_ID = 'w9:p1';
   process.env.PATH = `${bin}:${old.PATH}`;
@@ -101,9 +108,10 @@ process.stdout.write(JSON.stringify({ result }));
   return {
     calls: () => readFileSync(log, 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse),
     cleanup() {
-      const start = this.calls().find(([group, action]) => group === 'agent' && action === 'start');
-      const sessionPath = start?.[start.indexOf('--session') + 1];
-      if (sessionPath) rmSync(path.dirname(sessionPath), { recursive: true, force: true });
+      for (const start of this.calls().filter(([group, action]) => group === 'agent' && action === 'start')) {
+        const sessionPath = start[start.indexOf('--session') + 1];
+        if (sessionPath) rmSync(path.dirname(sessionPath), { recursive: true, force: true });
+      }
       for (const [key, value] of Object.entries(old)) {
         if (value === undefined) delete process.env[key];
         else process.env[key] = value;
@@ -238,6 +246,28 @@ test('the registered subagent tool returns a result for each mode and closes its
     } finally {
       env.cleanup();
     }
+  }
+});
+
+test('parallel children close only their own panes and retain separate answers', async () => {
+  const env = fixture({ PARALLEL: '1' });
+  try {
+    const result = await tool().execute('test', { tasks: [
+      { agent: 'poteto-agent', task: 'First child.' },
+      { agent: 'poteto-agent', task: 'Second child.' },
+    ] }, undefined, undefined, ctx);
+    assert.equal(result.details.mode, 'parallel');
+    assert.deepEqual(result.details.results.map(child => child.pane), [
+      { kind: 'closed', id: 'w9:p2' }, { kind: 'closed', id: 'w9:p3' },
+    ]);
+    assert.deepEqual(result.details.results.map(child => child.answer), ['First child.', 'Second child.']);
+    assert.deepEqual(env.calls().filter(([group, action]) => group === 'pane' && action === 'close')
+      .map(([, , pane]) => pane).sort(), ['w9:p2', 'w9:p3']);
+    const prompts = env.calls().filter(([group, action]) => group === 'agent' && action === 'prompt');
+    assert.equal(prompts.length, 2);
+    for (const prompt of prompts) assert.match(prompt[3], /Parent Herdr pane ID: w9:p1/);
+  } finally {
+    env.cleanup();
   }
 });
 
