@@ -257,7 +257,7 @@ test('parallel children close only their own panes and retain separate answers',
       { agent: 'poteto-agent', task: 'Second child.' },
     ] }, undefined, undefined, ctx);
     assert.equal(result.details.mode, 'parallel');
-    assert.deepEqual(result.details.results.map(child => child.pane), [
+    assert.deepEqual(result.details.results.map(child => child.pane).sort((a, b) => a.id.localeCompare(b.id)), [
       { kind: 'closed', id: 'w9:p2' }, { kind: 'closed', id: 'w9:p3' },
     ]);
     assert.deepEqual(result.details.results.map(child => child.answer), ['First child.', 'Second child.']);
