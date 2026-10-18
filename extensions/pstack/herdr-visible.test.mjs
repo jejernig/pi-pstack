@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, appendFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import registerPstack, { runChildVisible } from './index.ts';
@@ -107,10 +107,17 @@ process.stdout.write(JSON.stringify({ result }));
   for (const [key, value] of Object.entries(options)) process.env[`HERDR_TEST_${key}`] = value;
   return {
     calls: () => readFileSync(log, 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse),
+    recordCall: (args) => appendFileSync(log, JSON.stringify(args) + '\n'),
     cleanup() {
       for (const start of this.calls().filter(([group, action]) => group === 'agent' && action === 'start')) {
-        const sessionPath = start[start.indexOf('--session') + 1];
-        if (sessionPath) rmSync(path.dirname(sessionPath), { recursive: true, force: true });
+        const index = start.indexOf('--session');
+        const sessionPath = index < 0 ? undefined : start[index + 1];
+        if (!sessionPath) continue;
+        const directory = path.dirname(sessionPath);
+        if (path.basename(sessionPath) === 'session.jsonl' && path.dirname(directory) === tmpdir() &&
+          path.basename(directory).startsWith('pi-pstack-agent-')) {
+          rmSync(directory, { recursive: true, force: true });
+        }
       }
       for (const [key, value] of Object.entries(old)) {
         if (value === undefined) delete process.env[key];
@@ -120,6 +127,12 @@ process.stdout.write(JSON.stringify({ result }));
     },
   };
 }
+
+test('fixture cleanup ignores start calls without a verified session path', () => {
+  const env = fixture();
+  env.recordCall(['agent', 'start', 'orphan']);
+  assert.doesNotThrow(() => env.cleanup());
+});
 
 function tool() {
   const registered = new Map();

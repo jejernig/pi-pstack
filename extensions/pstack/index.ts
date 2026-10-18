@@ -265,14 +265,26 @@ function uniqueSubName(): string {
   return `psub-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function completedAssistantContent(entry: unknown): unknown[] | undefined {
+  if (!isRecord(entry) || entry.type !== "message") return undefined;
+  const message = entry.message;
+  if (!isRecord(message) || message.role !== "assistant" || message.stopReason !== "stop" ||
+    !Array.isArray(message.content)) return undefined;
+  return message.content;
+}
+
+function isTextPart(value: unknown): value is { type: "text"; text: string } {
+  return isRecord(value) && value.type === "text" && typeof value.text === "string";
+}
+
 function assistantTextFromLine(line: string): string | undefined {
   if (!line.trim()) return undefined;
   try {
-    const entry = JSON.parse(line) as { type?: string; message?: { role?: string; stopReason?: string; content?: Array<{ type?: string; text?: string }> } };
-    if (entry.type !== "message" || entry.message?.role !== "assistant" || entry.message.stopReason !== "stop") return undefined;
-    const content = entry.message.content;
-    if (!Array.isArray(content)) return undefined;
-    const text = content.filter((part) => part?.type === "text" && typeof part.text === "string")
+    const text = completedAssistantContent(JSON.parse(line))?.filter(isTextPart)
       .map((part) => part.text).join("\n").trim();
     return text || undefined;
   } catch {
@@ -436,6 +448,35 @@ async function initialVisibleIdentity(name: string, paneId: string): Promise<Chi
   return identity.status === "idle" || identity.status === "done" ? identity : undefined;
 }
 
+type VisibleChild = {
+  agent: AgentConfig;
+  task: TaskInput;
+  model: string | undefined;
+  name: string;
+  paneId: string;
+  parentPaneId: string;
+  original: ChildIdentity;
+  started: { sessionPath: string; directory: string };
+  signal: AbortSignal | undefined;
+};
+
+async function finishVisibleChild({ agent, task, model, name, paneId, parentPaneId, original, started, signal }: VisibleChild): Promise<ChildResult> {
+  const offset = sessionOffset(started.sessionPath);
+  const promptR = await runHerdrCmd(["agent", "prompt", name, visiblePrompt(agent, task, parentPaneId), "--wait", "--timeout", "600000"], 615000);
+  if (signal?.aborted) return openChildError(agent, task, model, paneId, "delegation was aborted; submission outcome unknown");
+  if (promptR.code !== 0) {
+    return openChildError(agent, task, model, paneId, `prompt outcome uncertain: ${promptR.stderr || promptR.stdout}`);
+  }
+  if (!settledChild(await childIdentity(name), original)) {
+    return openChildError(agent, task, model, paneId, "child identity or new settled turn not verified");
+  }
+  const answer = finalTextFromSession(started.sessionPath, offset);
+  if (!answer) return openChildError(agent, task, model, paneId, "no completed result was captured");
+  const pane = await closeCompletedChild(name, original);
+  if (pane.kind === "closed") await fsp.rm(started.directory, { recursive: true, force: true });
+  return { ...childSuccess(agent, task, model, answer), pane };
+}
+
 export async function runChildVisible(
   agent: AgentConfig,
   task: TaskInput,
@@ -446,7 +487,6 @@ export async function runChildVisible(
   if (signal?.aborted) {
     return { ...childError(agent, task, model, "aborted"), stopReason: "aborted" };
   }
-
   const parentPaneId = await verifiedParentPaneId();
   if (!parentPaneId) return childError(agent, task, model, "Herdr parent pane identity could not be verified");
   const name = uniqueSubName();
@@ -457,22 +497,7 @@ export async function runChildVisible(
   const original = await initialVisibleIdentity(name, paneId);
   if (!original) return openChildError(agent, task, model, paneId, "agent identity or readiness could not be verified");
   if (signal?.aborted) return openChildError(agent, task, model, paneId, "delegation was aborted before prompt");
-  const offset = sessionOffset(started.sessionPath);
-
-  const promptR = await runHerdrCmd(["agent", "prompt", name, visiblePrompt(agent, task, parentPaneId), "--wait", "--timeout", "600000"], 615000);
-  if (signal?.aborted) return openChildError(agent, task, model, paneId, "delegation was aborted; submission outcome unknown");
-  if (promptR.code !== 0) {
-    return openChildError(agent, task, model, paneId, `prompt outcome uncertain: ${promptR.stderr || promptR.stdout}`);
-  }
-  if (!settledChild(await childIdentity(name), original)) {
-    return openChildError(agent, task, model, paneId, "child identity or new settled turn not verified");
-  }
-
-  const answer = finalTextFromSession(started.sessionPath, offset);
-  if (!answer) return openChildError(agent, task, model, paneId, "no completed result was captured");
-  const pane = await closeCompletedChild(name, original);
-  if (pane.kind === "closed") await fsp.rm(started.directory, { recursive: true, force: true });
-  return { ...childSuccess(agent, task, model, answer), pane };
+  return finishVisibleChild({ agent, task, model, name, paneId, parentPaneId, original, started, signal });
 }
 
 async function runLimited<T>(items: T[], callback: (item: T, index: number) => Promise<ChildResult>): Promise<ChildResult[]> {
