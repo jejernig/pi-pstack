@@ -57,6 +57,7 @@ type ChildResult = {
   model?: string;
   exitCode: number;
   messages: Message[];
+  answer?: string;
   stderr: string;
   usage: Usage;
   stopReason?: string;
@@ -73,6 +74,12 @@ function packageRoot(): string {
 }
 
 function resultText(result: ChildResult): string {
+  if (result.answer) {
+    const pane = result.pane;
+    return pane && pane.kind !== "closed"
+      ? `${result.answer}\n\n[Pane ${pane.id}: ${pane.reason}; ${pane.kind}.]`
+      : result.answer;
+  }
   const final = [...result.messages].reverse().find((message) => message.role === "assistant");
   if (final?.role === "assistant") {
     const text = final.content.find((part) => part.type === "text");
@@ -236,12 +243,6 @@ async function runChild(
   return result;
 }
 
-const ANSI_ESCAPE = /\u001b\[[0-9;?]*[ -/]*[@-~]/g;
-
-function stripAnsiText(text: string): string {
-  return text.replace(ANSI_ESCAPE, "");
-}
-
 function runHerdrCmd(args: string[], timeoutMs = 30000): Promise<{ code: number; stdout: string; stderr: string }> {
   return new Promise((resolve) => {
     execFile("herdr", args, { timeout: timeoutMs, maxBuffer: 16 * 1024 * 1024 }, (err, stdout, stderr) => {
@@ -267,8 +268,8 @@ function uniqueSubName(): string {
 function assistantTextFromLine(line: string): string | undefined {
   if (!line.trim()) return undefined;
   try {
-    const entry = JSON.parse(line) as { type?: string; message?: { role?: string; content?: Array<{ type?: string; text?: string }> } };
-    if (entry.type !== "message" || entry.message?.role !== "assistant") return undefined;
+    const entry = JSON.parse(line) as { type?: string; message?: { role?: string; stopReason?: string; content?: Array<{ type?: string; text?: string }> } };
+    if (entry.type !== "message" || entry.message?.role !== "assistant" || entry.message.stopReason !== "stop") return undefined;
     const content = entry.message.content;
     if (!Array.isArray(content)) return undefined;
     const text = content.filter((part) => part?.type === "text" && typeof part.text === "string")
@@ -279,13 +280,15 @@ function assistantTextFromLine(line: string): string | undefined {
   }
 }
 
-function finalTextFromSession(sessionPath: string | undefined): string | undefined {
-  if (!sessionPath) return undefined;
+function finalTextFromSession(sessionPath: string, offset: number): string | undefined {
   try {
+    const data = fs.readFileSync(sessionPath);
+    if (data.length < offset) return undefined;
+    const appended = data.subarray(offset).toString("utf8");
+    const lines = appended.split("\n");
+    if (lines.at(-1)) lines.pop();
     let last: string | undefined;
-    for (const line of fs.readFileSync(sessionPath, "utf8").split("\n")) {
-      last = assistantTextFromLine(line) || last;
-    }
+    for (const line of lines) last = assistantTextFromLine(line) || last;
     return last;
   } catch {
     return undefined;
@@ -312,7 +315,8 @@ function childSuccess(agent: AgentConfig, task: TaskInput, model: string | undef
     task: task.task,
     model,
     exitCode: 0,
-    messages: [{ role: "assistant", content: [{ type: "text", text: answer }] } as Message],
+    messages: [],
+    answer,
     stderr: "",
     usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 1 },
     stopReason: "stop",
@@ -396,37 +400,34 @@ async function createVisiblePane(cwd: string): Promise<string | undefined> {
 }
 
 async function startVisibleAgent(name: string, paneId: string, agent: AgentConfig, model: string | undefined): Promise<
-  { kind: "started"; sessionPath?: string } | { kind: "failed" }
+  { kind: "started"; sessionPath: string; directory: string } | { kind: "failed" }
 > {
-  const piArgs = ["--extension", path.join(packageRoot(), "extensions/pstack/index.ts"),
-    "--skill", path.join(packageRoot(), "skills")];
+  const temp = await temporaryPrompt(agent);
+  const sessionPath = path.join(temp.directory, "session.jsonl");
+  const piArgs = ["--no-extensions", "--extension", path.join(packageRoot(), "extensions/pstack/index.ts"),
+    "--skill", path.join(packageRoot(), "skills"), "--append-system-prompt", temp.file, "--session", sessionPath];
   if (model) piArgs.push("--model", model);
   if (agent.tools?.length) piArgs.push("--tools", agent.tools.join(","));
-  for (let attempt = 0; attempt < 3; attempt++) {
-    const response = await runHerdrCmd(["agent", "start", name, "--kind", "pi", "--pane", paneId, "--", ...piArgs], 60000);
-    const started = parseJson<{ result?: { agent?: { agent_status?: string; agent_session?: { value?: string } } } }>(response)
-      ?.result?.agent;
-    if (response.code === 0 && started?.agent_status) {
-      return { kind: "started", sessionPath: started.agent_session?.value };
-    }
-    await new Promise((resolve) => setTimeout(resolve, 1500));
-  }
-  return { kind: "failed" };
+  const response = await runHerdrCmd(["agent", "start", name, "--kind", "pi", "--pane", paneId, "--", ...piArgs], 60000);
+  const started = parseJson<{ result?: { agent?: { agent_status?: string } } }>(response)?.result?.agent;
+  return response.code === 0 && started?.agent_status
+    ? { kind: "started", sessionPath, directory: temp.directory }
+    : { kind: "failed" };
 }
 
 function visiblePrompt(agent: AgentConfig, task: TaskInput, parentPaneId: string): string {
   const parts = [`[Subagent: ${agent.name}]`];
-  if (agent.systemPrompt?.trim()) parts.push(agent.systemPrompt.trim());
-  parts.push("---", `Parent Herdr pane ID: ${parentPaneId}. This identifies the pane that delegated your task. Include it in a requested handoff, but do not interrupt or close that pane.`,
+  parts.push(`Parent Herdr pane ID: ${parentPaneId}. This identifies the pane that delegated your task. Include it in a requested handoff, but do not interrupt or close that pane.`,
     `Delegated task:\n${task.task}`);
   return parts.join("\n\n");
 }
 
-async function visibleAnswer(name: string, sessionPath: string | undefined): Promise<string | undefined> {
-  const answer = finalTextFromSession(sessionPath);
-  if (answer) return answer;
-  const read = await runHerdrCmd(["agent", "read", name, "--source", "recent-unwrapped", "--lines", "400"]);
-  return read.code === 0 ? stripAnsiText(read.stdout).trim() || undefined : undefined;
+function sessionOffset(sessionPath: string): number {
+  try {
+    return fs.statSync(sessionPath).size;
+  } catch {
+    return 0;
+  }
 }
 
 async function initialVisibleIdentity(name: string, paneId: string): Promise<ChildIdentity | undefined> {
@@ -456,6 +457,7 @@ export async function runChildVisible(
   const original = await initialVisibleIdentity(name, paneId);
   if (!original) return openChildError(agent, task, model, paneId, "agent identity or readiness could not be verified");
   if (signal?.aborted) return openChildError(agent, task, model, paneId, "delegation was aborted before prompt");
+  const offset = sessionOffset(started.sessionPath);
 
   const promptR = await runHerdrCmd(["agent", "prompt", name, visiblePrompt(agent, task, parentPaneId), "--wait", "--timeout", "600000"], 615000);
   if (signal?.aborted) return openChildError(agent, task, model, paneId, "delegation was aborted; submission outcome unknown");
@@ -466,9 +468,11 @@ export async function runChildVisible(
     return openChildError(agent, task, model, paneId, "child identity or new settled turn not verified");
   }
 
-  const answer = await visibleAnswer(name, started.sessionPath);
+  const answer = finalTextFromSession(started.sessionPath, offset);
   if (!answer) return openChildError(agent, task, model, paneId, "no completed result was captured");
-  return { ...childSuccess(agent, task, model, answer), pane: await closeCompletedChild(name, original) };
+  const pane = await closeCompletedChild(name, original);
+  if (pane.kind === "closed") await fsp.rm(started.directory, { recursive: true, force: true });
+  return { ...childSuccess(agent, task, model, answer), pane };
 }
 
 async function runLimited<T>(items: T[], callback: (item: T, index: number) => Promise<ChildResult>): Promise<ChildResult[]> {

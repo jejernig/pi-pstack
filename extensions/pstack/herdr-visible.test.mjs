@@ -16,9 +16,9 @@ function fixture(options = {}) {
   const bin = path.join(root, 'bin');
   mkdirSync(bin);
   const session = path.join(root, 'session.jsonl');
-  writeFileSync(session, options.EMPTY_SESSION ? '' : JSON.stringify({ type: 'message', message: {
-    role: 'assistant', content: [{ type: 'text', text: 'verified result' }],
-  } }) + '\n');
+  writeFileSync(session, options.STALE_ANSWER ? JSON.stringify({ type: 'message', message: {
+    role: 'assistant', stopReason: 'stop', content: [{ type: 'text', text: 'stale result' }],
+  } }) + '\n' : '');
   const log = path.join(root, 'calls.jsonl');
   writeFileSync(log, '');
   writeFileSync(path.join(bin, 'herdr'), `#!/usr/bin/env node
@@ -28,7 +28,17 @@ appendFileSync(process.env.HERDR_TEST_LOG, JSON.stringify(args) + '\\n');
 let result = { accepted: true };
 if (args[0] === 'pane' && args[1] === 'current') result = { pane: { pane_id: process.env.HERDR_TEST_PARENT_MISMATCH ? 'w9:p3' : 'w9:p1', terminal_id: 'parent-terminal' } };
 if (args[0] === 'pane' && args[1] === 'split') result = { pane: { pane_id: 'w9:p2' } };
-if (args[0] === 'agent' && args[1] === 'start') result = { agent: { agent_status: 'idle', agent_session: { value: process.env.HERDR_TEST_SESSION } } };
+if (args[0] === 'agent' && args[1] === 'start') {
+  const promptFile = args[args.indexOf('--append-system-prompt') + 1];
+  if (promptFile) appendFileSync(process.env.HERDR_TEST_LOG, JSON.stringify(['system-prompt', readFileSync(promptFile, 'utf8')]) + '\\n');
+  const sessionPath = args[args.indexOf('--session') + 1];
+  if (sessionPath) require('node:fs').writeFileSync(sessionPath, readFileSync(process.env.HERDR_TEST_SESSION));
+  if (process.env.HERDR_TEST_START_UNCERTAIN) {
+    process.stderr.write('start response unavailable');
+    process.exit(1);
+  }
+  result = { agent: { agent_status: 'idle' } };
+}
 if (args[0] === 'agent' && args[1] === 'get') {
   const gets = readFileSync(process.env.HERDR_TEST_LOG, 'utf8').split('\\n').filter(x => x.includes('"get"')).length;
   result = { agent: { pane_id: 'w9:p2', terminal_id: gets > 1 && process.env.HERDR_TEST_REPLACEMENT ? 'replacement' : 'terminal-2', agent_status: gets > 1 ? (process.env.HERDR_TEST_STATUS || 'idle') : 'idle', state_change_seq: gets > 1 ? 4 : 1 } };
@@ -40,7 +50,19 @@ if (args[0] === 'agent' && args[1] === 'prompt' && process.env.HERDR_TEST_PROMPT
   process.stderr.write('timeout: submission outcome unknown');
   process.exit(1);
 }
-if (args[0] === 'agent' && args[1] === 'read' && process.env.HERDR_TEST_EMPTY_SESSION) process.exit(0);
+if (args[0] === 'agent' && args[1] === 'prompt' && !process.env.HERDR_TEST_EMPTY_SESSION) {
+  const start = readFileSync(process.env.HERDR_TEST_LOG, 'utf8').split('\\n').filter(Boolean).map(JSON.parse)
+    .find(x => x[0] === 'agent' && x[1] === 'start');
+  const sessionPath = start[start.indexOf('--session') + 1];
+  appendFileSync(sessionPath, JSON.stringify({ type: 'message', message: {
+    role: 'assistant', stopReason: process.env.HERDR_TEST_TOOL_ONLY ? 'toolUse' : 'stop',
+    content: [{ type: 'text', text: 'verified result' }],
+  } }) + '\\n');
+}
+if (args[0] === 'agent' && args[1] === 'read') {
+  process.stdout.write('Pi is idle.\\n> Prompt');
+  process.exit(0);
+}
 if (args[0] === 'pane' && args[1] === 'process-info') result = { process_info: { foreground_processes: [{ name: process.env.HERDR_TEST_FOREGROUND || 'pi' }] } };
 if (args[0] === 'pane' && args[1] === 'close' && process.env.HERDR_TEST_CLOSE_FAIL) {
   process.stderr.write('close response unavailable');
@@ -59,6 +81,9 @@ process.stdout.write(JSON.stringify({ result }));
     HERDR_TEST_CLOSE_FAIL: process.env.HERDR_TEST_CLOSE_FAIL,
     HERDR_TEST_EMPTY_SESSION: process.env.HERDR_TEST_EMPTY_SESSION,
     HERDR_TEST_PARENT_MISMATCH: process.env.HERDR_TEST_PARENT_MISMATCH,
+    HERDR_TEST_STALE_ANSWER: process.env.HERDR_TEST_STALE_ANSWER,
+    HERDR_TEST_START_UNCERTAIN: process.env.HERDR_TEST_START_UNCERTAIN,
+    HERDR_TEST_TOOL_ONLY: process.env.HERDR_TEST_TOOL_ONLY,
   };
   process.env.HERDR_PANE_ID = 'w9:p1';
   process.env.PATH = `${bin}:${old.PATH}`;
@@ -69,6 +94,9 @@ process.stdout.write(JSON.stringify({ result }));
   return {
     calls: () => readFileSync(log, 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse),
     cleanup() {
+      const start = this.calls().find(([group, action]) => group === 'agent' && action === 'start');
+      const sessionPath = start?.[start.indexOf('--session') + 1];
+      if (sessionPath) rmSync(path.dirname(sessionPath), { recursive: true, force: true });
       for (const [key, value] of Object.entries(old)) {
         if (value === undefined) delete process.env[key];
         else process.env[key] = value;
@@ -93,12 +121,20 @@ test('successful visible subagent result closes its owned pane', async () => {
   try {
     const result = await runChildVisible(agent, task, undefined, tmpdir(), undefined);
     assert.equal(result.exitCode, 0);
-    assert.deepEqual(result.messages, [{ role: 'assistant', content: [{ type: 'text', text: 'verified result' }] }]);
+    assert.equal(result.answer, 'verified result');
+    assert.deepEqual(result.messages, []);
     const closes = env.calls().filter(([group, action]) => group === 'pane' && action === 'close');
     assert.deepEqual(closes, [['pane', 'close', 'w9:p2']]);
     assert.match(env.calls().find(([group, action]) => group === 'agent' && action === 'start')[2], /^psub-/);
     const prompt = env.calls().find(([group, action]) => group === 'agent' && action === 'prompt');
     assert.match(prompt[3], /Parent Herdr pane ID: w9:p1/);
+    assert.doesNotMatch(prompt[3], /Return a result\./);
+    const start = env.calls().find(([group, action]) => group === 'agent' && action === 'start');
+    assert.ok(start.includes('--no-extensions'));
+    assert.ok(start.includes('--session'));
+    const promptFile = start[start.indexOf('--append-system-prompt') + 1];
+    assert.ok(promptFile.endsWith('/poteto-agent.md'));
+    assert.match(env.calls().find(([kind]) => kind === 'system-prompt')[1], /Return a result\./);
     assert.deepEqual(env.calls().find(([group, action]) => group === 'pane' && action === 'current'),
       ['pane', 'current', '--current']);
   } finally {
@@ -218,6 +254,43 @@ test('abort during a submitted prompt leaves the child pane and does not claim a
     const result = await pending;
     assert.equal(result.exitCode, 1);
     assert.match(result.stderr, /w9:p2/);
+    assert.deepEqual(env.calls().filter(([group, action]) => group === 'pane' && action === 'close'), []);
+  } finally {
+    env.cleanup();
+  }
+});
+
+test('stale assistant text and idle terminal output do not count as a new answer', async () => {
+  const env = fixture({ EMPTY_SESSION: '1', STALE_ANSWER: '1' });
+  try {
+    const result = await runChildVisible(agent, task, undefined, tmpdir(), undefined);
+    assert.equal(result.exitCode, 1);
+    assert.match(result.stderr, /no completed result/);
+    assert.deepEqual(env.calls().filter(([group, action]) => group === 'pane' && action === 'close'), []);
+  } finally {
+    env.cleanup();
+  }
+});
+
+test('a tool-use assistant message is not a completed answer', async () => {
+  const env = fixture({ TOOL_ONLY: '1' });
+  try {
+    const result = await runChildVisible(agent, task, undefined, tmpdir(), undefined);
+    assert.equal(result.exitCode, 1);
+    assert.match(result.stderr, /no completed result/);
+    assert.deepEqual(env.calls().filter(([group, action]) => group === 'pane' && action === 'close'), []);
+  } finally {
+    env.cleanup();
+  }
+});
+
+test('uncertain start is not retried and leaves its pane open', async () => {
+  const env = fixture({ START_UNCERTAIN: '1' });
+  try {
+    const result = await runChildVisible(agent, task, undefined, tmpdir(), undefined);
+    assert.equal(result.exitCode, 1);
+    assert.match(result.stderr, /w9:p2/);
+    assert.equal(env.calls().filter(([group, action]) => group === 'agent' && action === 'start').length, 1);
     assert.deepEqual(env.calls().filter(([group, action]) => group === 'pane' && action === 'close'), []);
   } finally {
     env.cleanup();

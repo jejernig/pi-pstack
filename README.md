@@ -26,7 +26,7 @@ Then restart Pi. Use `pi config` to enable or disable package resources.
 
 ## Pi subagents
 
-The extension registers a `subagent` tool using Pi's official isolated-process pattern. A child runs as a separate `pi --mode json --print --no-session` process and returns only its final result to the parent context.
+The extension registers a `subagent` tool. Outside Herdr, a child runs as a separate `pi --mode json --print --no-session` process. Inside Herdr, the tool starts the child in a named pane, reads its completed answer from the new session turn, and closes the pane after verifying its identity. If it cannot verify the answer or safely close the pane, the tool reports the pane ID for investigation.
 
 Bundled agents:
 
