@@ -25,6 +25,7 @@ const { appendFileSync, readFileSync } = require('node:fs');
 const args = process.argv.slice(2);
 appendFileSync(process.env.HERDR_TEST_LOG, JSON.stringify(args) + '\\n');
 let result = { accepted: true };
+if (args[0] === 'pane' && args[1] === 'current') result = { pane: { pane_id: process.env.HERDR_TEST_PARENT_MISMATCH ? 'w9:p3' : 'w9:p1', terminal_id: 'parent-terminal' } };
 if (args[0] === 'pane' && args[1] === 'split') result = { pane: { pane_id: 'w9:p2' } };
 if (args[0] === 'agent' && args[1] === 'start') result = { agent: { agent_status: 'idle', agent_session: { value: process.env.HERDR_TEST_SESSION } } };
 if (args[0] === 'agent' && args[1] === 'get') {
@@ -47,7 +48,8 @@ if (args[0] === 'pane' && args[1] === 'close' && process.env.HERDR_TEST_CLOSE_FA
 process.stdout.write(JSON.stringify({ result }));
 `, { mode: 0o755 });
   const old = {
-    PATH: process.env.PATH, HERDR_ENV: process.env.HERDR_ENV, HERDR_TEST_LOG: process.env.HERDR_TEST_LOG,
+    PATH: process.env.PATH, HERDR_ENV: process.env.HERDR_ENV, HERDR_PANE_ID: process.env.HERDR_PANE_ID,
+    HERDR_TEST_LOG: process.env.HERDR_TEST_LOG,
     HERDR_TEST_SESSION: process.env.HERDR_TEST_SESSION, HERDR_TEST_STATUS: process.env.HERDR_TEST_STATUS,
     HERDR_TEST_FOREGROUND: process.env.HERDR_TEST_FOREGROUND,
     HERDR_TEST_PROMPT_FAIL: process.env.HERDR_TEST_PROMPT_FAIL,
@@ -55,7 +57,9 @@ process.stdout.write(JSON.stringify({ result }));
     HERDR_TEST_PROMPT_DELAY: process.env.HERDR_TEST_PROMPT_DELAY,
     HERDR_TEST_CLOSE_FAIL: process.env.HERDR_TEST_CLOSE_FAIL,
     HERDR_TEST_EMPTY_SESSION: process.env.HERDR_TEST_EMPTY_SESSION,
+    HERDR_TEST_PARENT_MISMATCH: process.env.HERDR_TEST_PARENT_MISMATCH,
   };
+  process.env.HERDR_PANE_ID = 'w9:p1';
   process.env.PATH = `${bin}:${old.PATH}`;
   process.env.HERDR_ENV = '1';
   process.env.HERDR_TEST_LOG = log;
@@ -92,6 +96,22 @@ test('successful visible subagent result closes its owned pane', async () => {
     const closes = env.calls().filter(([group, action]) => group === 'pane' && action === 'close');
     assert.deepEqual(closes, [['pane', 'close', 'w9:p2']]);
     assert.match(env.calls().find(([group, action]) => group === 'agent' && action === 'start')[2], /^psub-/);
+    const prompt = env.calls().find(([group, action]) => group === 'agent' && action === 'prompt');
+    assert.match(prompt[3], /Parent Herdr pane ID: w9:p1/);
+    assert.deepEqual(env.calls().find(([group, action]) => group === 'pane' && action === 'current'),
+      ['pane', 'current', '--current']);
+  } finally {
+    env.cleanup();
+  }
+});
+
+test('a changed caller pane identity blocks delegation before splitting a child', async () => {
+  const env = fixture({ PARENT_MISMATCH: '1' });
+  try {
+    const result = await runChildVisible(agent, task, undefined, tmpdir(), undefined);
+    assert.equal(result.exitCode, 1);
+    assert.match(result.stderr, /parent pane identity/);
+    assert.equal(env.calls().some(([group, action]) => group === 'pane' && action === 'split'), false);
   } finally {
     env.cleanup();
   }
