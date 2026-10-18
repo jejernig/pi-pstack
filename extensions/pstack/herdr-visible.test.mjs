@@ -20,6 +20,7 @@ function fixture(options = {}) {
     role: 'assistant', content: [{ type: 'text', text: 'verified result' }],
   } }) + '\n');
   const log = path.join(root, 'calls.jsonl');
+  writeFileSync(log, '');
   writeFileSync(path.join(bin, 'herdr'), `#!/usr/bin/env node
 const { appendFileSync, readFileSync } = require('node:fs');
 const args = process.argv.slice(2);
@@ -66,7 +67,7 @@ process.stdout.write(JSON.stringify({ result }));
   process.env.HERDR_TEST_SESSION = session;
   for (const [key, value] of Object.entries(options)) process.env[`HERDR_TEST_${key}`] = value;
   return {
-    calls: () => readFileSync(log, 'utf8').trim().split('\n').map(JSON.parse),
+    calls: () => readFileSync(log, 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse),
     cleanup() {
       for (const [key, value] of Object.entries(old)) {
         if (value === undefined) delete process.env[key];
@@ -108,6 +109,19 @@ test('successful visible subagent result closes its owned pane', async () => {
 test('a changed caller pane identity blocks delegation before splitting a child', async () => {
   const env = fixture({ PARENT_MISMATCH: '1' });
   try {
+    const result = await runChildVisible(agent, task, undefined, tmpdir(), undefined);
+    assert.equal(result.exitCode, 1);
+    assert.match(result.stderr, /parent pane identity/);
+    assert.equal(env.calls().some(([group, action]) => group === 'pane' && action === 'split'), false);
+  } finally {
+    env.cleanup();
+  }
+});
+
+test('a missing caller pane ID blocks delegation before splitting a child', async () => {
+  const env = fixture();
+  try {
+    delete process.env.HERDR_PANE_ID;
     const result = await runChildVisible(agent, task, undefined, tmpdir(), undefined);
     assert.equal(result.exitCode, 1);
     assert.match(result.stderr, /parent pane identity/);
