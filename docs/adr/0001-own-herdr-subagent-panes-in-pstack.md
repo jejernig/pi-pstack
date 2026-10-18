@@ -8,7 +8,7 @@ The installed pstack extension split a pane for each visible subagent, returned 
 
 ## Decision
 
-Pstack names its own children `psub-*` and does not register them as observer-managed `sub-*` children. After a new settled child turn produces a result, pstack checks the named agent's original pane and terminal identity, foreground process, and settled state before closing its pane. It reports an open or unconfirmed pane ID in the tool result rather than retrying or closing on an uncertain prompt, blocked state, or cancellation. The observer continues to manage children it owns through its receipt protocol.
+Pstack names its own children `psub-*` and does not register them as observer-managed `sub-*` children. Before splitting, it checks the caller's `HERDR_PANE_ID` against `herdr pane current --current` and places the verified parent pane ID in the child's prompt. A missing or changed identity blocks delegation rather than giving the child the wrong pane. After a new settled child turn produces a result, pstack checks the named agent's original pane and terminal identity, foreground process, and settled state before closing its pane. It reports an open or unconfirmed pane ID in the tool result rather than retrying or closing on an uncertain prompt, blocked state, or cancellation. The observer continues to manage children it owns through its receipt protocol.
 
 ## Consequences
 

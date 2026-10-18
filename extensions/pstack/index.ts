@@ -379,6 +379,15 @@ async function closeCompletedChild(name: string, original: ChildIdentity): Promi
   return closePane(id);
 }
 
+async function verifiedParentPaneId(): Promise<string | undefined> {
+  const inheritedId = process.env.HERDR_PANE_ID;
+  if (!inheritedId) return undefined;
+  const response = await runHerdrCmd(["pane", "current", "--current"]);
+  if (response.code !== 0) return undefined;
+  const observed = parseJson<{ result?: { pane?: { pane_id?: unknown } } }>(response)?.result?.pane?.pane_id;
+  return observed === inheritedId ? inheritedId : undefined;
+}
+
 async function createVisiblePane(cwd: string): Promise<string | undefined> {
   const response = await runHerdrCmd(["pane", "split", "--current", "--direction", "right", "--cwd", cwd, "--no-focus"]);
   if (response.code !== 0) return undefined;
@@ -405,10 +414,11 @@ async function startVisibleAgent(name: string, paneId: string, agent: AgentConfi
   return { kind: "failed" };
 }
 
-function visiblePrompt(agent: AgentConfig, task: TaskInput): string {
+function visiblePrompt(agent: AgentConfig, task: TaskInput, parentPaneId: string): string {
   const parts = [`[Subagent: ${agent.name}]`];
   if (agent.systemPrompt?.trim()) parts.push(agent.systemPrompt.trim());
-  parts.push("---", `Delegated task:\n${task.task}`);
+  parts.push("---", `Parent Herdr pane ID: ${parentPaneId}. This identifies the pane that delegated your task. Include it in a requested handoff, but do not interrupt or close that pane.`,
+    `Delegated task:\n${task.task}`);
   return parts.join("\n\n");
 }
 
@@ -436,6 +446,8 @@ export async function runChildVisible(
     return { ...childError(agent, task, model, "aborted"), stopReason: "aborted" };
   }
 
+  const parentPaneId = await verifiedParentPaneId();
+  if (!parentPaneId) return childError(agent, task, model, "Herdr parent pane identity could not be verified");
   const name = uniqueSubName();
   const paneId = await createVisiblePane(task.cwd ?? parentCwd);
   if (!paneId) return childError(agent, task, model, "herdr pane split did not return a pane ID");
@@ -445,7 +457,7 @@ export async function runChildVisible(
   if (!original) return openChildError(agent, task, model, paneId, "agent identity or readiness could not be verified");
   if (signal?.aborted) return openChildError(agent, task, model, paneId, "delegation was aborted before prompt");
 
-  const promptR = await runHerdrCmd(["agent", "prompt", name, visiblePrompt(agent, task), "--wait", "--timeout", "600000"], 615000);
+  const promptR = await runHerdrCmd(["agent", "prompt", name, visiblePrompt(agent, task, parentPaneId), "--wait", "--timeout", "600000"], 615000);
   if (signal?.aborted) return openChildError(agent, task, model, paneId, "delegation was aborted; submission outcome unknown");
   if (promptR.code !== 0) {
     return openChildError(agent, task, model, paneId, `prompt outcome uncertain: ${promptR.stderr || promptR.stdout}`);
