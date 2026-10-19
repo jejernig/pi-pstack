@@ -191,6 +191,23 @@ describe("main", () => {
     expect(harness.stdout[0]).not.toContain('"kind":"QUEUE"');
   });
 
+  it("returns a non-green blocker for a PR without checks", async () => {
+    const reader = fakeReader({ fastPath: { kind: "checks", checks: [] } });
+    const harness = testRuntime(reader);
+    const code = await main(
+      [
+        "--owner", "owner", "--repo", "repo", "--pr", "1",
+        "--status-only", "--max-query-errors", "1", "--pretty",
+      ],
+      harness.runtime
+    );
+    expect(code).toBe(7);
+    expect(reader.calls).toContain("checkRollupPage:null");
+    expect(harness.stdout).toHaveLength(1);
+    expect(harness.stdout[0]).toContain("status-query");
+    expect(harness.stdout[0]).not.toContain("✅");
+  });
+
   it("returns exit 4 for a hidden GitHub-side CI refusal", async () => {
     const reader = fakeReader({
       facts: { mergeStateStatus: "BLOCKED" },
