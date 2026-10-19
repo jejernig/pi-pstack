@@ -2,7 +2,7 @@ import { afterEach, expect, it } from "bun:test";
 import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { GhGitHubReader } from "./github.ts";
+import { ChecksUnavailable, GhGitHubReader, resolveChecks } from "./github.ts";
 import { parsePrNumber } from "./types.ts";
 
 const originalPath = process.env.PATH;
@@ -39,4 +39,29 @@ exit 2
     kind: "checks",
     checks: [{ name: "ci", kind: "passed" }],
   });
+});
+
+it("does not verify CI when both GitHub check paths are empty", async () => {
+  fixtureDir = mkdtempSync(join(tmpdir(), "watch-pr-no-ci-"));
+  const gh = join(fixtureDir, "gh");
+  writeFileSync(gh, `#!/bin/sh
+if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
+  printf '{"statusCheckRollup":[]}\\n'
+  exit 0
+fi
+if [ "$1" = "api" ] && [ "$2" = "graphql" ]; then
+  printf '{"data":{"repository":{"pullRequest":{"commits":{"nodes":[{"commit":{"statusCheckRollup":null}}]}}}}}\\n'
+  exit 0
+fi
+exit 2
+`);
+  chmodSync(gh, 0o755);
+  process.env.PATH = `${fixtureDir}:${originalPath ?? ""}`;
+  await expect(
+    resolveChecks(new GhGitHubReader(), {
+      owner: "owner",
+      repo: "repo",
+      number: parsePrNumber(42),
+    })
+  ).rejects.toBeInstanceOf(ChecksUnavailable);
 });
