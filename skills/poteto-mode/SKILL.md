@@ -13,6 +13,7 @@ disable-model-invocation: true
 Remaining triggers:
 
 - Nontrivial change, architecture decision, or "are we sure?" → the **how** skill.
+- Before reading or searching a candidate repository path, call `repository_discover` with the actual Git root. Use `read` or `rg` on the returned path; when missing, use its neighboring paths.
 - Before asking the user to choose an approach, classify the fork. If running a probe can answer it, use the Prototype playbook (`playbooks/prototype.md`) and let evidence decide. Ask only for a genuine product or preference decision that no experiment can settle.
 - Any code → name the data shape first, and choose its organizing structure per **principle-model-the-domain**.
 - Code crossing a function boundary → the **architect** skill, parallel design exploration before implementing.
