@@ -232,23 +232,6 @@ function checkDetails(value: Record<string, unknown>, nameKey: string) {
     workflow: typeof value.workflow === "string" ? value.workflow : "",
   };
 }
-export function parseFastCheck(value: unknown): T.Check {
-  const object = record(value, "check");
-  const details = checkDetails(object, "name");
-  const state = string(object.state, "check.state").toUpperCase();
-  const bucket = string(object.bucket, "check.bucket");
-  if (
-    bucket === "fail" ||
-    ["FAILURE", "ERROR", "ACTION_REQUIRED"].includes(state)
-  )
-    return { ...details, kind: "failed", reportedState: state };
-  if (bucket === "pending") return pendingOrGate(details, state);
-  if (bucket === "pass")
-    return { ...details, kind: "passed", reportedState: state };
-  if (bucket === "skipping")
-    return { ...details, kind: "skipped", reportedState: state };
-  return { ...details, kind: "failed", reportedState: state };
-}
 // The owner-approval gate is excluded from pending everywhere, so the rule has
 // one home. Classifying it as pending on either read path makes the watcher
 // wait on a human, which is the behaviour #172004 removed from the Python.
@@ -516,18 +499,24 @@ export class GhGitHubReader implements T.GitHubReader {
     const result = await run([
       "gh",
       "pr",
-      "checks",
+      "view",
       String(context.number),
       "--repo",
       `${context.owner}/${context.repo}`,
       "--json",
-      "name,state,description,link,workflow,bucket",
+      "statusCheckRollup",
     ]);
-    if ([0, 1, 8].includes(result.code) && result.stdout.trim()) {
+    if (result.code === 0 && result.stdout.trim()) {
       try {
-        const value = parseJson(result.stdout, "gh pr checks");
-        if (Array.isArray(value))
-          return { kind: "checks", checks: value.map(parseFastCheck) };
+        const value = parseJson(result.stdout, "gh pr view");
+        const rollup = record(value, "gh pr view").statusCheckRollup;
+        if (Array.isArray(rollup))
+          return {
+            kind: "checks",
+            checks: rollup
+              .map(mapRollupNode)
+              .filter((check): check is T.Check => check !== null),
+          };
       } catch (error) {
         if (!(error instanceof WatcherQueryError)) throw error;
       }
