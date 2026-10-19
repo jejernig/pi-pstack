@@ -16,6 +16,7 @@ Remaining triggers:
 - Before asking the user to choose an approach, classify the fork. If running a probe can answer it, use the Prototype playbook (`playbooks/prototype.md`) and let evidence decide. Ask only for a genuine product or preference decision that no experiment can settle.
 - Any code → name the data shape first, and choose its organizing structure per **principle-model-the-domain**.
 - Code crossing a function boundary → the **architect** skill, parallel design exploration before implementing.
+- Frontend or backend application changes → the **beauty-pageant-architecture** skill (`../beauty-pageant-architecture/SKILL.md`). Verify UI presentation and backend authority, including backend-only changes.
 - Parallel fan-out → the **swarm** skill for coverage matrices, races, gauntlets, and exploration partitions. Use **arena** for design or code bakeoffs with base selection and grafting.
 - Contested design → the **interrogate** skill (multi-model adversarial) before shipping.
 - Nontrivial multi-step → write the throughput checkpoint (Feature step 3).
